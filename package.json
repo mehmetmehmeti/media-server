@@ -1,0 +1,22 @@
+{
+  "name": "local-mediasoup-whip-poc",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "server": "node server.mjs",
+    "client": "vite --host 0.0.0.0",
+    "dev": "concurrently -k -n server,client \"npm:server\" \"npm:client\""
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^5.1.0",
+    "mediasoup": "^3.20.0",
+    "mediasoup-client": "^3.18.7",
+    "sdp-transform": "^2.15.0"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "vite": "^7.1.7"
+  }
+}
