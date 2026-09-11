@@ -67,6 +67,23 @@ const router = await worker.createRouter({
         { type: 'goog-remb' },
         { type: 'transport-cc' }
       ]
+    },
+    {
+      kind: 'video',
+      mimeType: 'video/H264',
+      clockRate: 90000,
+      parameters: {
+        'packetization-mode': 1,
+        'profile-level-id': '640028',
+        'level-asymmetry-allowed': 1
+      },
+      rtcpFeedback: [
+        { type: 'nack' },
+        { type: 'nack', parameter: 'pli' },
+        { type: 'ccm', parameter: 'fir' },
+        { type: 'goog-remb' },
+        { type: 'transport-cc' }
+      ]
     }
   ]
 });
@@ -76,6 +93,7 @@ console.log(`HTTP/WHIP API: http://${ANNOUNCED_ADDRESS}:${HTTP_PORT}`);
 console.log(`WebRTC media: ${ANNOUNCED_ADDRESS}:${MEDIA_PORT} UDP/TCP`);
 
 const whipSessions = new Map();
+const rtpSessions = new Map();
 const viewerSessions = new Map();
 const streams = new Map();
 
@@ -110,6 +128,7 @@ function authorizeViewerClose(req, res, next) {
 }
 
 function parseFmtp(config = '') {
+  const numericParameters = new Set(['apt', 'packetization-mode']);
   const parameters = {};
   for (const piece of config.split(';')) {
     const [rawKey, ...rest] = piece.trim().split('=');
@@ -120,7 +139,7 @@ function parseFmtp(config = '') {
       continue;
     }
     const numeric = Number(rawValue);
-    parameters[rawKey] = Number.isFinite(numeric) && String(numeric) === rawValue
+    parameters[rawKey] = numericParameters.has(rawKey) && Number.isFinite(numeric) && String(numeric) === rawValue
       ? numeric
       : rawValue;
   }
@@ -348,6 +367,44 @@ function closeWhipSession(sessionId, reason = 'closed') {
   whipSessions.delete(sessionId);
 }
 
+function closeRtpSession(sessionId, reason = 'closed') {
+  const session = rtpSessions.get(sessionId);
+  if (!session) return;
+  console.log(`Closing RTP session ${sessionId} (${session.streamId}): ${reason}`);
+  const stream = streams.get(session.streamId);
+  if (stream?.rtpSessionId === sessionId) {
+    for (const viewerId of [...stream.viewers.keys()]) closeViewerSession(viewerId, 'publisher closed');
+    streams.delete(session.streamId);
+  }
+  session.producer?.close();
+  session.transport?.close();
+  rtpSessions.delete(sessionId);
+}
+
+function h264ProducerParameters({ payloadType = 96, ssrc = 2222, profileLevelId = '42e01f' } = {}) {
+  return {
+    codecs: [
+      {
+        mimeType: 'video/H264',
+        payloadType,
+        clockRate: 90000,
+        parameters: {
+          'packetization-mode': 1,
+          'profile-level-id': profileLevelId,
+          'level-asymmetry-allowed': 1
+        },
+        rtcpFeedback: []
+      }
+    ],
+    encodings: [{ ssrc }],
+    rtcp: {
+      cname: `rtp-${ssrc}`,
+      reducedSize: true,
+      mux: true
+    }
+  };
+}
+
 app.options('/whip/:streamId', (req, res) => {
   res.set({
     'Accept-Post': 'application/sdp',
@@ -489,6 +546,88 @@ app.delete('/whip/session/:sessionId', requirePublisher, (req, res) => {
   res.sendStatus(200);
 });
 
+app.post('/rtp/:streamId', requirePublisher, async (req, res) => {
+  let transport;
+  let producer;
+  try {
+    const streamId = req.params.streamId;
+    const existingStream = streams.get(streamId);
+    if (existingStream?.producer && !existingStream.producer.closed) {
+      return res.status(409).json({ error: `stream ${streamId} already has an active publisher` });
+    }
+
+    const payloadType = Number(req.body?.payloadType ?? 96);
+    const ssrc = Number(req.body?.ssrc ?? 2222);
+    const profileLevelId = String(req.body?.profileLevelId ?? '42e01f');
+    if (!Number.isInteger(payloadType) || payloadType < 96 || payloadType > 127) {
+      return res.status(400).json({ error: 'payloadType must be a dynamic RTP payload type from 96 to 127' });
+    }
+    if (!Number.isInteger(ssrc) || ssrc <= 0) {
+      return res.status(400).json({ error: 'ssrc must be a positive integer' });
+    }
+
+    const sessionId = crypto.randomUUID();
+    transport = await router.createPlainTransport({
+      listenInfo: {
+        protocol: 'udp',
+        ip: LISTEN_IP,
+        announcedAddress: ANNOUNCED_ADDRESS
+      },
+      rtcpMux: true,
+      comedia: true,
+      appData: { role: 'rtp-publisher', streamId }
+    });
+
+    producer = await transport.produce({
+      kind: 'video',
+      rtpParameters: h264ProducerParameters({ payloadType, ssrc, profileLevelId }),
+      appData: { streamId, source: 'rtp' }
+    });
+
+    producer.on('transportclose', () => console.log('RTP publisher transport closed'));
+    producer.on('score', (score) => console.log('RTP publisher score', score));
+
+    rtpSessions.set(sessionId, {
+      streamId,
+      transport,
+      producer,
+      payloadType,
+      ssrc,
+      createdAt: now()
+    });
+    streams.set(streamId, {
+      streamId,
+      rtpSessionId: sessionId,
+      transport,
+      producer,
+      viewers: new Map(),
+      createdAt: now()
+    });
+
+    console.log(`RTP publisher ready: stream=${streamId}, session=${sessionId}, rtpPort=${transport.tuple.localPort}, producer=${producer.id}`);
+
+    res.status(201).json({
+      sessionId,
+      streamId,
+      ip: ANNOUNCED_ADDRESS,
+      port: transport.tuple.localPort,
+      payloadType,
+      ssrc
+    });
+  } catch (error) {
+    producer?.close();
+    transport?.close();
+    console.error('RTP publisher setup failed', error);
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.delete('/rtp/session/:sessionId', requirePublisher, (req, res) => {
+  if (!rtpSessions.has(req.params.sessionId)) return res.sendStatus(404);
+  closeRtpSession(req.params.sessionId, 'RTP DELETE');
+  res.sendStatus(200);
+});
+
 app.get('/api/health', (req, res) => {
   res.json({
     ok: true,
@@ -496,9 +635,11 @@ app.get('/api/health', (req, res) => {
     streams: [...streams.values()].map((stream) => ({
       streamId: stream.streamId,
       producerId: stream.producer?.id ?? null,
+      source: stream.whipSessionId ? 'whip' : stream.rtpSessionId ? 'rtp' : 'unknown',
       viewers: stream.viewers.size
     })),
     whipSessions: whipSessions.size,
+    rtpSessions: rtpSessions.size,
     viewers: viewerSessions.size
   });
 });
@@ -532,8 +673,33 @@ app.get('/api/debug/stats', requireViewer, async (req, res) => {
   for (const [sessionId, session] of whipSessions.entries()) {
     publishers.push({
       sessionId,
+      source: 'whip',
       streamId: session.streamId,
       etag: session.etag,
+      transport: session.transport
+        ? {
+            ...describeTransport(session.transport),
+            stats: await session.transport.getStats()
+          }
+        : null,
+      producer: session.producer
+        ? {
+            id: session.producer.id,
+            closed: session.producer.closed,
+            paused: session.producer.paused,
+            stats: await session.producer.getStats()
+          }
+        : null
+    });
+  }
+
+  for (const [sessionId, session] of rtpSessions.entries()) {
+    publishers.push({
+      sessionId,
+      source: 'rtp',
+      streamId: session.streamId,
+      payloadType: session.payloadType,
+      ssrc: session.ssrc,
       transport: session.transport
         ? {
             ...describeTransport(session.transport),
@@ -584,6 +750,7 @@ app.get('/api/debug/stats', requireViewer, async (req, res) => {
     streams: [...streams.values()].map((stream) => ({
       streamId: stream.streamId,
       whipSessionId: stream.whipSessionId,
+      rtpSessionId: stream.rtpSessionId,
       producerId: stream.producer?.id ?? null,
       viewers: stream.viewers.size
     })),
@@ -759,6 +926,7 @@ async function shutdown(signal) {
   httpServer.close();
   for (const sessionId of [...viewerSessions.keys()]) closeViewerSession(sessionId, signal);
   for (const sessionId of [...whipSessions.keys()]) closeWhipSession(sessionId, signal);
+  for (const sessionId of [...rtpSessions.keys()]) closeRtpSession(sessionId, signal);
   webRtcServer.close();
   router.close();
   worker.close();

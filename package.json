@@ -6,7 +6,8 @@
   "scripts": {
     "server": "node server.mjs",
     "client": "vite --host 0.0.0.0",
-    "dev": "concurrently -k -n server,client \"npm:server\" \"npm:client\""
+    "dev": "concurrently -k -n server,client \"npm:server\" \"npm:client\"",
+    "build:whip-client": "./scripts/build-whip-client.sh"
   },
   "dependencies": {
     "cors": "^2.8.5",
