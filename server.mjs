@@ -53,6 +53,18 @@ const router = await worker.createRouter({
   mediaCodecs: [
     {
       kind: 'video',
+      mimeType: 'video/VP8',
+      clockRate: 90000,
+      rtcpFeedback: [
+        { type: 'nack' },
+        { type: 'nack', parameter: 'pli' },
+        { type: 'ccm', parameter: 'fir' },
+        { type: 'goog-remb' },
+        { type: 'transport-cc' }
+      ]
+    },
+    {
+      kind: 'video',
       mimeType: 'video/H264',
       clockRate: 90000,
       parameters: {
@@ -164,21 +176,23 @@ function selectVideoOffer(parsedOffer) {
     throw new Error(`publisher video direction must be sendonly/sendrecv, got ${direction}`);
   }
 
-  const h264Rtp = (media.rtp ?? []).find(
-    (entry) => String(entry.codec).toUpperCase() === 'H264'
+  const selectedRtp = (media.rtp ?? []).find(
+    (entry) => ['VP8', 'H264'].includes(String(entry.codec).toUpperCase())
   );
-  if (!h264Rtp) throw new Error('SDP offer does not contain H.264');
+  if (!selectedRtp) throw new Error('SDP offer does not contain VP8 or H.264');
 
-  const h264Pt = Number(h264Rtp.payload);
-  const h264Fmtp = (media.fmtp ?? []).find((entry) => Number(entry.payload) === h264Pt);
-  const h264Parameters = parseFmtp(h264Fmtp?.config ?? '');
+  const selectedPt = Number(selectedRtp.payload);
+  const selectedCodec = String(selectedRtp.codec).toUpperCase();
+  const selectedMimeType = `video/${selectedCodec}`;
+  const selectedFmtp = (media.fmtp ?? []).find((entry) => Number(entry.payload) === selectedPt);
+  const selectedParameters = parseFmtp(selectedFmtp?.config ?? '');
 
-  if (Number(h264Parameters['packetization-mode'] ?? 0) !== 1) {
+  if (selectedCodec === 'H264' && Number(selectedParameters['packetization-mode'] ?? 0) !== 1) {
     throw new Error('H.264 packetization-mode=1 is required for this PoC');
   }
 
   const feedback = (media.rtcpFb ?? [])
-    .filter((entry) => Number(entry.payload) === h264Pt || entry.payload === '*')
+    .filter((entry) => Number(entry.payload) === selectedPt || entry.payload === '*')
     .map((entry) => ({
       type: entry.type,
       ...(entry.subtype ? { parameter: entry.subtype } : {})
@@ -186,10 +200,10 @@ function selectVideoOffer(parsedOffer) {
 
   const codecs = [
     {
-      mimeType: 'video/H264',
-      payloadType: h264Pt,
-      clockRate: Number(h264Rtp.rate ?? 90000),
-      parameters: h264Parameters,
+      mimeType: selectedMimeType,
+      payloadType: selectedPt,
+      clockRate: Number(selectedRtp.rate ?? 90000),
+      parameters: selectedParameters,
       rtcpFeedback: feedback
     }
   ];
@@ -197,7 +211,7 @@ function selectVideoOffer(parsedOffer) {
   const rtxRtp = (media.rtp ?? []).find((entry) => {
     if (String(entry.codec).toLowerCase() !== 'rtx') return false;
     const fmtp = (media.fmtp ?? []).find((item) => Number(item.payload) === Number(entry.payload));
-    return Number(parseFmtp(fmtp?.config ?? '').apt) === h264Pt;
+    return Number(parseFmtp(fmtp?.config ?? '').apt) === selectedPt;
   });
 
   if (rtxRtp) {
@@ -205,7 +219,7 @@ function selectVideoOffer(parsedOffer) {
       mimeType: 'video/rtx',
       payloadType: Number(rtxRtp.payload),
       clockRate: Number(rtxRtp.rate ?? 90000),
-      parameters: { apt: h264Pt },
+      parameters: { apt: selectedPt },
       rtcpFeedback: []
     });
   }
@@ -251,8 +265,9 @@ function selectVideoOffer(parsedOffer) {
 
   return {
     media,
-    h264Pt,
-    h264Fmtp: h264Fmtp?.config ?? '',
+    primaryPt: selectedPt,
+    primaryCodec: selectedCodec,
+    primaryFmtp: selectedFmtp?.config ?? '',
     codecs,
     headerExtensions,
     encodings,
@@ -299,10 +314,10 @@ function buildWhipAnswer({ offer, selected, transport }) {
     const codecName = codec.mimeType.split('/')[1];
     lines.push(`a=rtpmap:${codec.payloadType} ${codecName}/${codec.clockRate}`);
 
-    if (codec.mimeType.toLowerCase() === 'video/h264' && selected.h264Fmtp) {
-      lines.push(`a=fmtp:${codec.payloadType} ${selected.h264Fmtp}`);
+    if (codec.mimeType.toLowerCase() !== 'video/rtx' && selected.primaryFmtp) {
+      lines.push(`a=fmtp:${codec.payloadType} ${selected.primaryFmtp}`);
     } else if (codec.mimeType.toLowerCase() === 'video/rtx') {
-      lines.push(`a=fmtp:${codec.payloadType} apt=${selected.h264Pt}`);
+      lines.push(`a=fmtp:${codec.payloadType} apt=${selected.primaryPt}`);
     }
 
     for (const fb of codec.rtcpFeedback ?? []) {
@@ -852,7 +867,7 @@ app.post('/api/viewer/:sessionId/consume', requireViewer, async (req, res) => {
     if (!session || !transport) return res.sendStatus(404);
 
     if (!router.canConsume({ producerId: stream.producer.id, rtpCapabilities: req.body.rtpCapabilities })) {
-      return res.status(400).json({ error: 'viewer cannot consume the H.264 producer' });
+      return res.status(400).json({ error: 'viewer cannot consume the producer codec' });
     }
 
     const consumer = await transport.consume({
