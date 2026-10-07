@@ -34,13 +34,17 @@ fi
 
 if [[ ! -d "$SRC_DIR/.git" ]]; then
   git clone --depth 1 https://github.com/meetecho/simple-whip-client.git "$SRC_DIR"
-else
-  git -C "$SRC_DIR" fetch --depth 1 origin main
-  git -C "$SRC_DIR" checkout -q FETCH_HEAD
+fi
+
+if ! git -C "$SRC_DIR" apply --reverse --check "$SCRIPT_DIR/whip-consent.patch" 2>/dev/null; then
+  git -C "$SRC_DIR" apply "$SCRIPT_DIR/whip-consent.patch"
 fi
 
 make -C "$SRC_DIR"
-cp "$SRC_DIR/whip-client" "$BIN_DIR/whip-client"
+temporary="$(mktemp "$BIN_DIR/whip-client.XXXXXX")"
+trap 'rm -f "$temporary"' EXIT
+install -m 755 "$SRC_DIR/whip-client" "$temporary"
+mv -f "$temporary" "$BIN_DIR/whip-client"
 
 cat <<EOF
 Built libsoup3 WHIP client:

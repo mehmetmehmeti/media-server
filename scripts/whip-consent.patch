@@ -1,0 +1,21 @@
+diff --git a/src/whip-client.c b/src/whip-client.c
+--- a/src/whip-client.c
++++ b/src/whip-client.c
+@@ -399,6 +399,17 @@ static gboolean whip_initialize(void) {
+ 	/* Get a pointer to the PeerConnection object */
+ 	pc = gst_bin_get_by_name(GST_BIN(pipeline), "sendonly");
+ 	g_assert_nonnull(pc);
++	/* mediasoup ICE Lite requires authenticated consent keepalives. */
++	GObject *ice = NULL, *nice = NULL;
++	g_object_get(pc, "ice-agent", &ice, NULL);
++	if(ice != NULL) {
++		g_object_get(ice, "agent", &nice, NULL);
++		if(nice != NULL) {
++			g_object_set(nice, "keepalive-conncheck", TRUE, NULL);
++			g_object_unref(nice);
++		}
++		g_object_unref(ice);
++	}
+ 	/* Check if there's any TURN server to add */
+ 	if((turn_server != NULL && turn_server[0] != NULL) || (auto_turn_server != NULL && auto_turn_server[0] != NULL)) {
+ 		int i=0;
